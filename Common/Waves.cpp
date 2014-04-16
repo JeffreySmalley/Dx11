@@ -91,8 +91,8 @@ void Waves::Init(UINT m, UINT n, float dx, float dt, float speed, float damping)
 		{
 			float x = -halfWidth + j*dx;
 
-			mPrevSolution[i*n+j] = XMFLOAT3(x, 0.0f, z);
-			mCurrSolution[i*n+j] = XMFLOAT3(x, 0.0f, z);
+			mPrevSolution[i*n+j] = XMFLOAT3(x*20, 5.0f, z*20);
+			mCurrSolution[i*n+j] = XMFLOAT3(x*20, 5.0f, z*20);
 			mNormals[i*n+j]      = XMFLOAT3(0.0f, 1.0f, 0.0f);
 			mTangentX[i*n+j]     = XMFLOAT3(1.0f, 0.0f, 0.0f);
 		}

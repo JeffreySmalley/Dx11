@@ -20,6 +20,7 @@
 #include "Camera.h"
 #include "Sky.h"
 #include "Terrain.h"
+#include "Waves.h"
  
 class TerrainApp : public D3DApp
 {
@@ -37,6 +38,16 @@ public:
 	void OnMouseMove(WPARAM btnState, int x, int y);
 
 private:
+	void BuildWaveGeometryBuffers();
+	ID3D11Buffer* mWavesVB;
+	ID3D11Buffer* mWavesIB;
+	ID3D11ShaderResourceView* mWavesMapSRV;
+	Waves mWaves;
+	Material mWavesMat;
+	XMFLOAT4X4 mWaterTexTransform;
+	XMFLOAT4X4 mWavesWorld;
+	XMFLOAT2 mWaterTexOffset;
+
 	Sky* mSky;
 	Terrain mTerrain;
 
@@ -66,13 +77,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
 }
 
 TerrainApp::TerrainApp(HINSTANCE hInstance)
-: D3DApp(hInstance), mSky(0), mWalkCamMode(false)
+: D3DApp(hInstance), mSky(0), mWalkCamMode(false), mWavesVB(0), mWavesIB(0), mWavesMapSRV(0),
+  mWaterTexOffset(0.0f, 0.0f)
 {
 	mMainWndCaption = L"Terrain Demo";
 	mEnable4xMsaa = false;
 
 	mLastMousePos.x = 0;
 	mLastMousePos.y = 0;
+
+	XMMATRIX I = XMMatrixIdentity();
+	XMStoreFloat4x4(&mWavesWorld, I);
 
 	mCam.SetPosition(0.0f, 2.0f, 100.0f);
 
@@ -90,6 +105,10 @@ TerrainApp::TerrainApp(HINSTANCE hInstance)
 	mDirLights[2].Diffuse  = XMFLOAT4(0.2f, 0.2f, 0.2f, 1.0f);
 	mDirLights[2].Specular = XMFLOAT4(0.2f, 0.2f, 0.2f, 1.0f);
 	mDirLights[2].Direction = XMFLOAT3(-0.57735f, -0.57735f, -0.57735f);
+	
+	mWavesMat.Ambient  = XMFLOAT4(0.5f, 0.5f, 0.5f, 1.0f);
+	mWavesMat.Diffuse  = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.5f);
+	mWavesMat.Specular = XMFLOAT4(0.8f, 0.8f, 0.8f, 32.0f);
 }
 
 TerrainApp::~TerrainApp()
@@ -97,6 +116,10 @@ TerrainApp::~TerrainApp()
 	md3dImmediateContext->ClearState();
 	
 	SafeDelete(mSky);
+
+	ReleaseCOM(mWavesVB);
+	ReleaseCOM(mWavesIB);
+	ReleaseCOM(mWavesMapSRV);
 
 	Effects::DestroyAll();
 	InputLayouts::DestroyAll();
@@ -107,6 +130,8 @@ bool TerrainApp::Init()
 {
 	if(!D3DApp::Init())
 		return false;
+
+	mWaves.Init(160, 160, 1.0f, 0.03f, 5.0f, 0.3f);
 
 	// Must init Effects first since InputLayouts depend on shader signatures.
 	Effects::InitAll(md3dDevice);
@@ -128,6 +153,7 @@ bool TerrainApp::Init()
 	tii.HeightmapHeight = 2049;
 	tii.CellSpacing = 0.5f;
 
+	BuildWaveGeometryBuffers();
 	mTerrain.Init(md3dDevice, md3dImmediateContext, tii);
 	return true;
 }
@@ -174,6 +200,45 @@ void TerrainApp::UpdateScene(float dt)
 		mCam.SetPosition(camPos.x, y + 2.0f, camPos.z);
 	}
 
+	static float t_base = 0.0f;
+	if( (mTimer.TotalTime() - t_base) >= 0.1f )
+	{
+		t_base += 0.1f;
+ 
+		DWORD i = 5 + rand() % (mWaves.RowCount()-10);
+		DWORD j = 5 + rand() % (mWaves.ColumnCount()-10);
+
+		float r = MathHelper::RandF(0.5f, 1.0f);
+
+		mWaves.Disturb(i, j, r);
+	}
+
+	mWaves.Update(dt);
+
+	D3D11_MAPPED_SUBRESOURCE mappedData;
+	HR(md3dImmediateContext->Map(mWavesVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedData));
+
+	Vertex::Basic32* v = reinterpret_cast<Vertex::Basic32*>(mappedData.pData);
+	for(UINT i = 0; i < mWaves.VertexCount(); ++i)
+	{
+		v[i].Pos    = mWaves[i];
+		v[i].Normal = mWaves.Normal(i);
+
+		// Derive tex-coords in [0,1] from position.
+		v[i].Tex.x  = 0.5f + mWaves[i].x / mWaves.Width();
+		v[i].Tex.y  = 0.5f - mWaves[i].z / mWaves.Depth();
+	}
+
+	md3dImmediateContext->Unmap(mWavesVB, 0);
+
+	XMMATRIX wavesScale = XMMatrixScaling(5.0f, 5.0f, 0.0f);
+
+	mWaterTexOffset.y += 0.05f*dt;
+	mWaterTexOffset.x += 0.1f*dt;	
+	XMMATRIX wavesOffset = XMMatrixTranslation(mWaterTexOffset.x, mWaterTexOffset.y, 0.0f);
+
+	XMStoreFloat4x4(&mWaterTexTransform, wavesScale*wavesOffset);
+
 	mCam.UpdateViewMatrix();
 }
 
@@ -187,6 +252,14 @@ void TerrainApp::DrawScene()
  
 	float blendFactor[] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+	UINT stride = sizeof(Vertex::Basic32);
+    UINT offset = 0;
+
+	ID3DX11EffectTechnique* landAndWavesTech;
+	
+	landAndWavesTech = Effects::BasicFX->Light3Tech;
+
+
 	if( GetAsyncKeyState('1') & 0x8000 )
 		md3dImmediateContext->RSSetState(RenderStates::WireframeRS);
 
@@ -199,6 +272,34 @@ void TerrainApp::DrawScene()
 	// restore default states, as the SkyFX changes them in the effect file.
 	md3dImmediateContext->RSSetState(0);
 	md3dImmediateContext->OMSetDepthStencilState(0, 0);
+	D3DX11_TECHNIQUE_DESC techDesc;
+
+	landAndWavesTech->GetDesc( &techDesc );
+    for(UINT p = 0; p < techDesc.Passes; ++p)
+    {
+		md3dImmediateContext->IASetVertexBuffers(0, 1, &mWavesVB, &stride, &offset);
+		md3dImmediateContext->IASetIndexBuffer(mWavesIB, DXGI_FORMAT_R32_UINT, 0);
+
+		// Set per object constants.
+		XMMATRIX world = XMLoadFloat4x4(&mWavesWorld);
+		XMMATRIX worldInvTranspose = MathHelper::InverseTranspose(world);
+		XMMATRIX worldViewProj = mCam.ViewProj();
+		
+		Effects::BasicFX->SetWorld(world);
+		Effects::BasicFX->SetWorldInvTranspose(worldInvTranspose);
+		Effects::BasicFX->SetWorldViewProj(worldViewProj);
+		Effects::BasicFX->SetTexTransform(XMLoadFloat4x4(&mWaterTexTransform));
+		Effects::BasicFX->SetMaterial(mWavesMat);
+		Effects::BasicFX->SetDiffuseMap(mWavesMapSRV);
+
+		//RL Tell the context what blend state to use (HINT: OMSetBlendState)
+
+		landAndWavesTech->GetPassByIndex(p)->Apply(0, md3dImmediateContext);
+		md3dImmediateContext->DrawIndexed(3*mWaves.TriangleCount(), 0, 0);
+
+		// Restore default blend state
+		md3dImmediateContext->OMSetBlendState(0, blendFactor, 0xffffffff);
+    }
 
 	HR(mSwapChain->Present(0, 0));
 }
@@ -230,4 +331,53 @@ void TerrainApp::OnMouseMove(WPARAM btnState, int x, int y)
 
 	mLastMousePos.x = x;
 	mLastMousePos.y = y;
+}
+void TerrainApp::BuildWaveGeometryBuffers()
+{
+	// Create the vertex buffer.  Note that we allocate space only, as
+	// we will be updating the data every time step of the simulation.
+
+    D3D11_BUFFER_DESC vbd;
+    vbd.Usage = D3D11_USAGE_DYNAMIC;
+	vbd.ByteWidth = sizeof(Vertex::Basic32) * mWaves.VertexCount();
+    vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    vbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    vbd.MiscFlags = 0;
+    HR(md3dDevice->CreateBuffer(&vbd, 0, &mWavesVB));
+
+
+	// Create the index buffer.  The index buffer is fixed, so we only 
+	// need to create and set once.
+
+	std::vector<UINT> indices(3*mWaves.TriangleCount()); // 3 indices per face
+
+	// Iterate over each quad.
+	UINT m = mWaves.RowCount();
+	UINT n = mWaves.ColumnCount();
+	int k = 0;
+	for(UINT i = 0; i < m-1; ++i)
+	{
+		for(DWORD j = 0; j < n-1; ++j)
+		{
+			indices[k]   = i*n+j;
+			indices[k+1] = i*n+j+1;
+			indices[k+2] = (i+1)*n+j;
+
+			indices[k+3] = (i+1)*n+j;
+			indices[k+4] = i*n+j+1;
+			indices[k+5] = (i+1)*n+j+1;
+
+			k += 6; // next quad
+		}
+	}
+
+	D3D11_BUFFER_DESC ibd;
+    ibd.Usage = D3D11_USAGE_IMMUTABLE;
+	ibd.ByteWidth = sizeof(UINT) * indices.size();
+    ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    ibd.CPUAccessFlags = 0;
+    ibd.MiscFlags = 0;
+    D3D11_SUBRESOURCE_DATA iinitData;
+    iinitData.pSysMem = &indices[0];
+    HR(md3dDevice->CreateBuffer(&ibd, &iinitData, &mWavesIB));
 }
